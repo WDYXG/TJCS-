@@ -65,6 +65,8 @@ class RPCServer:
             def do_GET(self) -> None:
                 if self.path == "/status":
                     self._write_json(200, raft_node.status())
+                elif self.path == "/cluster/members":
+                    self._write_json(200, raft_node.cluster_members())
                 elif self.path.startswith("/kv/"):
                     key = urllib.parse.unquote(self.path[len("/kv/") :])
                     response = raft_node.get_value(key)
@@ -91,10 +93,17 @@ class RPCServer:
                         response = raft_node.handle_install_snapshot(request)
                     elif self.path == "/debug/append_log":
                         response = raft_node.append_command(request)
+                    elif self.path == "/cluster/add_node":
+                        response = raft_node.add_node(request)
+                    elif self.path == "/cluster/remove_node":
+                        response = raft_node.remove_node(request)
                     else:
                         self._write_json(404, {"error": "not found"})
                         return
-                    self._write_json(200, response)
+                    if self.path.startswith("/cluster/"):
+                        self._write_command_response(response)
+                    else:
+                        self._write_json(200, response)
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                     self._write_json(400, {"error": str(error)})
 

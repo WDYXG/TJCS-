@@ -25,6 +25,7 @@ class NodeRole(str, Enum):
     FOLLOWER = "follower"
     CANDIDATE = "candidate"
     LEADER = "leader"
+    REMOVED = "removed"
 
 
 @dataclass
@@ -48,14 +49,19 @@ class RaftNode:
         storage: Any | None = None,
         node_urls: dict[str, str] | None = None,
         snapshot_threshold: int = 5,
+        members: list[str] | None = None,
+        peer_addresses: dict[str, str] | None = None,
     ) -> None:
         self.node_id = node_id
-        self.peers = peers
         self.rpc_client = rpc_client
         self.state_machine = state_machine
         self.storage = storage
         self.node_urls = node_urls or {}
         self.snapshot_threshold = snapshot_threshold
+        self.members = list(dict.fromkeys(members or [node_id, *peers]))
+        self.peer_addresses = peer_addresses or {peer: peer for peer in peers}
+        self.peers: list[str] = []
+        self._refresh_peers()
 
         self.current_term = 0
         self.voted_for: str | None = None
@@ -80,6 +86,8 @@ class RaftNode:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._restore_persistent_state()
+        if not self._is_voting_member():
+            self.role = NodeRole.REMOVED
 
     def start(self) -> None:
         """Start election and heartbeat timers."""
@@ -98,6 +106,9 @@ class RaftNode:
     def start_election(self) -> None:
         """Become candidate, request votes, and become leader on a majority."""
         with self._lock:
+            if not self._is_voting_member():
+                self.role = NodeRole.REMOVED
+                return
             self.role = NodeRole.CANDIDATE
             self.current_term += 1
             election_term = self.current_term
@@ -151,6 +162,9 @@ class RaftNode:
             if term > self.current_term:
                 self._become_follower(term)
 
+            if not self._is_voting_member() or candidate_id not in self.members:
+                return {"term": self.current_term, "vote_granted": False}
+
             local_last_index = self._last_log_index()
             local_last_term = self._term_at(local_last_index) or 0
             candidate_is_up_to_date = (last_log_term, last_log_index) >= (
@@ -188,7 +202,11 @@ class RaftNode:
             if term > self.current_term:
                 self._become_follower(term)
             else:
-                self.role = NodeRole.FOLLOWER
+                self.role = (
+                    NodeRole.FOLLOWER
+                    if self._is_voting_member()
+                    else NodeRole.REMOVED
+                )
             self.leader_id = leader_id
             self._reset_election_timer()
 
@@ -233,7 +251,11 @@ class RaftNode:
             if term > self.current_term:
                 self._become_follower(term)
             else:
-                self.role = NodeRole.FOLLOWER
+                self.role = (
+                    NodeRole.FOLLOWER
+                    if self._is_voting_member()
+                    else NodeRole.REMOVED
+                )
             self.leader_id = leader_id
             self._reset_election_timer()
 
@@ -249,10 +271,20 @@ class RaftNode:
             self.last_included_index = snapshot_index
             self.last_included_term = snapshot_term
             self.snapshot_exists = True
+            if request.get("members"):
+                self.members = list(request["members"])
+            if request.get("peer_addresses"):
+                self.peer_addresses = dict(request["peer_addresses"])
+            self._refresh_peers()
             self.commit_index = max(self.commit_index, snapshot_index)
             self.last_applied = max(self.last_applied, snapshot_index)
             if self.state_machine is not None:
                 self.state_machine.load(kv)
+            self.role = (
+                NodeRole.FOLLOWER
+                if self._is_voting_member()
+                else NodeRole.REMOVED
+            )
             self._save_snapshot(kv)
             self._persist_state()
             return {"term": self.current_term, "success": True}
@@ -271,7 +303,51 @@ class RaftNode:
                 "last_included_index": self.last_included_index,
                 "last_included_term": self.last_included_term,
                 "snapshot_exists": self.snapshot_exists,
+                "members": list(self.members),
+                "cluster_size": len(self.members),
+                "majority": self._majority(),
+                "active": self._is_voting_member(),
             }
+
+    def cluster_members(self) -> dict:
+        """Return the current voting configuration."""
+        with self._lock:
+            return {
+                "members": list(self.members),
+                "cluster_size": len(self.members),
+                "majority": self._majority(),
+            }
+
+    def add_node(self, request: dict) -> dict:
+        """Submit one teaching-style add-node configuration entry."""
+        node_id = str(request["node_id"])
+        host = str(request["host"])
+        port = int(request["port"])
+        with self._lock:
+            if self.role != NodeRole.LEADER:
+                return self.not_leader_response()
+            if node_id in self.members:
+                return {"success": False, "error": "node already exists"}
+        return self.append_command(
+            {
+                "type": "add_node",
+                "node_id": node_id,
+                "host": host,
+                "port": port,
+            }
+        )
+
+    def remove_node(self, request: dict) -> dict:
+        """Submit one teaching-style remove-node configuration entry."""
+        node_id = str(request["node_id"])
+        with self._lock:
+            if self.role != NodeRole.LEADER:
+                return self.not_leader_response()
+            if node_id not in self.members:
+                return {"success": False, "error": "node not found"}
+            if len(self.members) <= 1:
+                return {"success": False, "error": "cannot remove last member"}
+        return self.append_command({"type": "remove_node", "node_id": node_id})
 
     def send_heartbeats(self) -> None:
         """Send AppendEntries to all followers, empty when logs are current."""
@@ -299,11 +375,15 @@ class RaftNode:
             self.log.append(entry)
             self._persist_state()
 
+        replication_peers = list(self.peers)
         replicated_to = 1
-        for peer in self.peers:
+        for peer in replication_peers:
             if self._replicate_to_peer(peer):
                 replicated_to += 1
         self._advance_commit_index()
+        for peer in replication_peers:
+            if peer not in self.peers:
+                self._replicate_to_peer(peer)
         self.send_heartbeats()
         with self._lock:
             return {
@@ -370,7 +450,9 @@ class RaftNode:
                 entry = self._entry_at(next_index)
                 if entry is None:
                     break
-                if self.state_machine is not None:
+                if entry.command.get("type") in ("add_node", "remove_node"):
+                    self._apply_membership_change(entry.command)
+                elif self.state_machine is not None:
                     self.state_machine.apply(entry.command)
                 self.last_applied = entry.index
 
@@ -500,6 +582,8 @@ class RaftNode:
             "last_included_index": self.last_included_index,
             "last_included_term": self.last_included_term,
             "kv": kv,
+            "members": list(self.members),
+            "peer_addresses": dict(self.peer_addresses),
         }
 
     def _save_snapshot(self, kv: dict) -> None:
@@ -510,6 +594,8 @@ class RaftNode:
                 "last_included_index": self.last_included_index,
                 "last_included_term": self.last_included_term,
                 "kv": kv,
+                "members": list(self.members),
+                "peer_addresses": dict(self.peer_addresses),
             }
         )
         self.storage.save_kv(kv)
@@ -524,10 +610,19 @@ class RaftNode:
             self.snapshot_exists = True
             if self.state_machine is not None:
                 self.state_machine.load(snapshot.get("kv", {}))
+            if snapshot.get("members"):
+                self.members = list(snapshot["members"])
+            if snapshot.get("peer_addresses"):
+                self.peer_addresses = dict(snapshot["peer_addresses"])
 
         state = self.storage.load_state()
         self.current_term = int(state.get("current_term", self.current_term))
         self.voted_for = state.get("voted_for")
+        if state.get("members"):
+            self.members = list(state["members"])
+        if state.get("peer_addresses"):
+            self.peer_addresses = dict(state["peer_addresses"])
+        self._refresh_peers()
         self.log = [LogEntry(**entry) for entry in state.get("log", [])]
         self.commit_index = max(int(state.get("commit_index", 0)), self.last_included_index)
         self.commit_index = min(self.commit_index, self._last_log_index())
@@ -546,6 +641,8 @@ class RaftNode:
                 "last_applied": self.last_applied,
                 "last_included_index": self.last_included_index,
                 "last_included_term": self.last_included_term,
+                "members": list(self.members),
+                "peer_addresses": dict(self.peer_addresses),
             }
         )
 
@@ -574,6 +671,40 @@ class RaftNode:
     def _truncate_from(self, index: int) -> None:
         self.log = [entry for entry in self.log if entry.index < index]
 
+    def _apply_membership_change(self, command: dict) -> None:
+        command_type = command["type"]
+        node_id = str(command["node_id"])
+        if command_type == "add_node":
+            address = f"{command['host']}:{int(command['port'])}"
+            if node_id not in self.members:
+                self.members.append(node_id)
+            self.peer_addresses[node_id] = address
+            self.node_urls[node_id] = f"http://{address}"
+        elif command_type == "remove_node":
+            self.members = [member for member in self.members if member != node_id]
+        self._refresh_peers()
+        if self.role == NodeRole.LEADER:
+            for peer in self.peers:
+                self.next_index.setdefault(peer, self._last_log_index() + 1)
+                self.match_index.setdefault(peer, 0)
+        if self._is_voting_member() and self.role == NodeRole.REMOVED:
+            self.role = NodeRole.FOLLOWER
+        elif not self._is_voting_member():
+            self.role = NodeRole.REMOVED
+            self.leader_id = None
+
+    def _refresh_peers(self) -> None:
+        for member, address in self.peer_addresses.items():
+            self.node_urls.setdefault(member, f"http://{address}")
+        self.peers = [
+            self.peer_addresses[member]
+            for member in self.members
+            if member != self.node_id and member in self.peer_addresses
+        ]
+
+    def _is_voting_member(self) -> bool:
+        return self.node_id in self.members
+
     def _append_failure(self, match_index: int | None = None) -> dict:
         return {
             "term": self.current_term,
@@ -585,7 +716,9 @@ class RaftNode:
 
     def _become_follower(self, term: int) -> None:
         self.current_term = term
-        self.role = NodeRole.FOLLOWER
+        self.role = (
+            NodeRole.FOLLOWER if self._is_voting_member() else NodeRole.REMOVED
+        )
         self.voted_for = None
         self.leader_id = None
         self.votes_received.clear()
@@ -603,7 +736,7 @@ class RaftNode:
                 self.send_heartbeats()
                 with self._lock:
                     self._last_heartbeat_sent = time.monotonic()
-            elif role != NodeRole.LEADER and election_due:
+            elif role in (NodeRole.FOLLOWER, NodeRole.CANDIDATE) and election_due:
                 self.start_election()
 
     def _reset_election_timer(self) -> None:
@@ -611,7 +744,7 @@ class RaftNode:
         self.election_timeout = self._new_election_timeout()
 
     def _majority(self) -> int:
-        return (len(self.peers) + 1) // 2 + 1
+        return len(self.members) // 2 + 1
 
     @staticmethod
     def _new_election_timeout() -> float:

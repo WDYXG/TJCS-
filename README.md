@@ -19,10 +19,10 @@
 - Leader 提供基于 Raft 日志的 HTTP PUT、GET 和 DELETE 接口。
 - ReadIndex 风格线性一致读：GET 不追加日志，但读取前会确认 Leader 仍持有多数派。
 - 教学版 Raft 快照：压缩已应用日志，并通过 InstallSnapshot 恢复落后 follower。
+- 教学版动态成员变更：通过 Raft 日志添加或移除投票节点。
 - 使用 Python 标准库提供 Raft HTTP JSON RPC 和状态接口。
 
-当前尚未实现成员变更。GET 只允许 Leader 服务，并在读取前执行 ReadIndex
-多数派确认。
+GET 只允许 Leader 服务，并在读取前执行 ReadIndex 多数派确认。
 
 ## 配置格式
 
@@ -230,6 +230,32 @@ python scripts/test_snapshot.py
 
 这是为了课程展示实现的教学版快照，采用完整 KV 数据传输，没有实现分块快照。
 
+## 教学版成员变更
+
+成员变更通过普通 Raft 日志提交。提交 `add_node` 或 `remove_node` 后，各节点在
+应用日志时更新当前投票成员，`majority` 按 `len(members) // 2 + 1` 动态计算。
+
+管理接口：
+
+- `POST /cluster/add_node`
+- `POST /cluster/remove_node`
+- `GET /cluster/members`
+
+新节点可以先作为非投票 standby 启动：
+
+```powershell
+python src/node.py --node-id node4 --port 8004 --data-dir data/node4 serve
+```
+
+运行自动添加 node4、追赶日志、切换 majority 并移除 node4 的演示：
+
+```powershell
+python scripts/test_membership.py
+```
+
+这是课程项目中的教学版成员变更，不实现完整 Joint Consensus。同一时间只进行
+一个成员变更，并要求当前 Leader 和旧配置多数派可用。
+
 脚本每一步都会打印 `[OK]` 或 `[FAIL]`，适合截图放入课程报告。运行脚本前请
 确认默认端口 `8001`、`8002`、`8003` 没有被其他进程占用。自动脚本固定使用
 默认三节点配置，不读取项目根目录中的自定义 `config.json`。
@@ -238,3 +264,4 @@ python scripts/test_snapshot.py
 
 - 增加更完整的网络分区测试。
 - 改进快照传输与持久化异常处理。
+- 如需生产级安全性，使用 Joint Consensus 替换教学版成员变更。

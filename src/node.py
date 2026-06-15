@@ -2,7 +2,7 @@
 
 import argparse
 
-from config import load_config
+from config import NodeConfig, load_config
 from raft import RaftNode
 from rpc import RPCClient, RPCServer
 from state_machine import KVStateMachine
@@ -16,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--node-id", required=True, help="Node identifier")
     parser.add_argument("--data-dir", help="Directory for local JSON data")
+    parser.add_argument("--port", type=int, help="Port for a standalone joining node")
     parser.add_argument(
         "--config",
         default="config.json",
@@ -76,7 +77,16 @@ def serve(args: argparse.Namespace) -> None:
         None,
     )
     if node_config is None:
-        raise SystemExit(f"node_id not found in config: {args.node_id}")
+        if args.port is None:
+            raise SystemExit(
+                f"node_id not found in config: {args.node_id}; use --port to start it as standby"
+            )
+        node_config = NodeConfig(
+            node_id=args.node_id,
+            host="127.0.0.1",
+            port=args.port,
+            data_dir=args.data_dir or f"data/{args.node_id}",
+        )
 
     storage = JSONStorage(node_config.data_dir)
     state_machine = KVStateMachine()
@@ -84,6 +94,12 @@ def serve(args: argparse.Namespace) -> None:
     node_urls = {
         node.node_id: f"http://{node.host}:{node.port}" for node in cluster.nodes
     }
+    node_urls[node_config.node_id] = f"http://{node_config.host}:{node_config.port}"
+    peer_addresses = {
+        node.node_id: f"{node.host}:{node.port}" for node in cluster.nodes
+    }
+    peer_addresses[node_config.node_id] = f"{node_config.host}:{node_config.port}"
+    initial_members = [node.node_id for node in cluster.nodes]
     raft_node = RaftNode(
         args.node_id,
         node_config.peers,
@@ -91,6 +107,8 @@ def serve(args: argparse.Namespace) -> None:
         state_machine=state_machine,
         storage=storage,
         node_urls=node_urls,
+        members=initial_members,
+        peer_addresses=peer_addresses,
     )
     server = RPCServer(node_config.host, node_config.port, raft_node)
     raft_node.start()
