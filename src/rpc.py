@@ -20,6 +20,9 @@ class RPCClient:
     def append_entries(self, peer: str, request: dict) -> dict | None:
         return self._post(peer, "/raft/append_entries", request)
 
+    def install_snapshot(self, peer: str, request: dict) -> dict | None:
+        return self._post(peer, "/raft/install_snapshot", request)
+
     def _post(self, peer: str, path: str, data: dict) -> dict | None:
         request = urllib.request.Request(
             f"http://{peer}{path}",
@@ -84,6 +87,8 @@ class RPCServer:
                         response = raft_node.handle_request_vote(request)
                     elif self.path == "/raft/append_entries":
                         response = raft_node.handle_append_entries(request)
+                    elif self.path == "/raft/install_snapshot":
+                        response = raft_node.handle_install_snapshot(request)
                     elif self.path == "/debug/append_log":
                         response = raft_node.append_command(request)
                     else:

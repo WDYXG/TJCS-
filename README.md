@@ -18,10 +18,11 @@
 - committed 日志按顺序应用到 KV 状态机，并持久化每个节点的 KV 数据。
 - Leader 提供基于 Raft 日志的 HTTP PUT、GET 和 DELETE 接口。
 - ReadIndex 风格线性一致读：GET 不追加日志，但读取前会确认 Leader 仍持有多数派。
+- 教学版 Raft 快照：压缩已应用日志，并通过 InstallSnapshot 恢复落后 follower。
 - 使用 Python 标准库提供 Raft HTTP JSON RPC 和状态接口。
 
-当前尚未实现快照和成员变更。GET 只允许 Leader 服务，并在读取前执行
-ReadIndex 多数派确认。
+当前尚未实现成员变更。GET 只允许 Leader 服务，并在读取前执行 ReadIndex
+多数派确认。
 
 ## 配置格式
 
@@ -208,11 +209,32 @@ ReadIndex 演示会验证 GET 不追加日志、Leader 在一个 follower 宕机
 python scripts/test_read_index.py
 ```
 
+## 教学版快照
+
+节点默认每应用 `5` 条新日志创建一次快照。快照保存在节点数据目录的
+`snapshot.json`，内容包括：
+
+- `last_included_index`
+- `last_included_term`
+- 当前 KV 状态
+
+创建快照后，节点删除 index 小于或等于 `last_included_index` 的日志，但后续
+日志继续使用全局递增 index。落后 follower 如果已经落后于 Leader 的快照边界，
+Leader 会通过 `InstallSnapshot` 发送完整快照，再继续普通 AppendEntries。
+
+运行快照创建、日志压缩和落后 follower 恢复演示：
+
+```powershell
+python scripts/test_snapshot.py
+```
+
+这是为了课程展示实现的教学版快照，采用完整 KV 数据传输，没有实现分块快照。
+
 脚本每一步都会打印 `[OK]` 或 `[FAIL]`，适合截图放入课程报告。运行脚本前请
 确认默认端口 `8001`、`8002`、`8003` 没有被其他进程占用。自动脚本固定使用
 默认三节点配置，不读取项目根目录中的自定义 `config.json`。
 
 ## 后续运行目标
 
-- 持久化 Raft term、投票和日志，使节点重启后完整恢复。
-- 增加故障恢复和网络分区测试。
+- 增加更完整的网络分区测试。
+- 改进快照传输与持久化异常处理。

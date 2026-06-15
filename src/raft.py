@@ -1,4 +1,4 @@
-"""Minimal Raft leader election and heartbeat implementation."""
+"""Teaching-oriented Raft with election, replication, ReadIndex, and snapshots."""
 
 import random
 import threading
@@ -15,7 +15,10 @@ class RaftRPCClient(Protocol):
         """Send RequestVote to one peer."""
 
     def append_entries(self, peer: str, request: dict) -> dict | None:
-        """Send an empty AppendEntries heartbeat to one peer."""
+        """Send AppendEntries to one peer."""
+
+    def install_snapshot(self, peer: str, request: dict) -> dict | None:
+        """Send InstallSnapshot to one peer."""
 
 
 class NodeRole(str, Enum):
@@ -26,7 +29,7 @@ class NodeRole(str, Enum):
 
 @dataclass
 class LogEntry:
-    """One Raft log entry."""
+    """One Raft log entry with a global index."""
 
     index: int
     term: int
@@ -34,7 +37,7 @@ class LogEntry:
 
 
 class RaftNode:
-    """Minimal Raft node supporting election, heartbeats, and log replication."""
+    """Minimal Raft node with log compaction and teaching-style snapshots."""
 
     def __init__(
         self,
@@ -44,9 +47,16 @@ class RaftNode:
         state_machine: Any | None = None,
         storage: Any | None = None,
         node_urls: dict[str, str] | None = None,
+        snapshot_threshold: int = 5,
     ) -> None:
         self.node_id = node_id
         self.peers = peers
+        self.rpc_client = rpc_client
+        self.state_machine = state_machine
+        self.storage = storage
+        self.node_urls = node_urls or {}
+        self.snapshot_threshold = snapshot_threshold
+
         self.current_term = 0
         self.voted_for: str | None = None
         self.role = NodeRole.FOLLOWER
@@ -54,21 +64,22 @@ class RaftNode:
         self.election_timeout = self._new_election_timeout()
         self.last_heartbeat_time = time.monotonic()
         self.votes_received: set[str] = set()
+
         self.log: list[LogEntry] = []
         self.commit_index = 0
         self.last_applied = 0
+        self.last_included_index = 0
+        self.last_included_term = 0
+        self.snapshot_exists = False
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
-        self.state_machine = state_machine
-        self.storage = storage
-        self.node_urls = node_urls or {}
 
-        self.rpc_client = rpc_client
         self.heartbeat_interval = 0.5
         self._last_heartbeat_sent = 0.0
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._restore_persistent_state()
 
     def start(self) -> None:
         """Start election and heartbeat timers."""
@@ -94,14 +105,14 @@ class RaftNode:
             self.votes_received = {self.node_id}
             self.leader_id = None
             self._reset_election_timer()
-
-        with self._lock:
+            self._persist_state()
             request = {
                 "term": election_term,
                 "candidate_id": self.node_id,
-                "last_log_index": len(self.log),
-                "last_log_term": self.log[-1].term if self.log else 0,
+                "last_log_index": self._last_log_index(),
+                "last_log_term": self._term_at(self._last_log_index()) or 0,
             }
+
         for peer in self.peers:
             response = self.rpc_client.request_vote(peer, request)
             if response is None:
@@ -124,7 +135,7 @@ class RaftNode:
                 self.role = NodeRole.LEADER
                 self.leader_id = self.node_id
                 self.next_index = {
-                    peer: len(self.log) + 1 for peer in self.peers
+                    peer: self._last_log_index() + 1 for peer in self.peers
                 }
                 self.match_index = {peer: 0 for peer in self.peers}
                 self._last_heartbeat_sent = 0.0
@@ -140,12 +151,13 @@ class RaftNode:
             if term > self.current_term:
                 self._become_follower(term)
 
-            vote_granted = False
-            local_last_term = self.log[-1].term if self.log else 0
+            local_last_index = self._last_log_index()
+            local_last_term = self._term_at(local_last_index) or 0
             candidate_is_up_to_date = (last_log_term, last_log_index) >= (
                 local_last_term,
-                len(self.log),
+                local_last_index,
             )
+            vote_granted = False
             if (
                 term == self.current_term
                 and self.voted_for in (None, candidate_id)
@@ -155,6 +167,7 @@ class RaftNode:
                 self.role = NodeRole.FOLLOWER
                 self.leader_id = None
                 self._reset_election_timer()
+                self._persist_state()
                 vote_granted = True
 
             return {"term": self.current_term, "vote_granted": vote_granted}
@@ -170,55 +183,79 @@ class RaftNode:
 
         with self._lock:
             if term < self.current_term:
-                return {
-                    "term": self.current_term,
-                    "success": False,
-                    "match_index": len(self.log),
-                }
+                return self._append_failure()
 
             if term > self.current_term:
                 self._become_follower(term)
             else:
                 self.role = NodeRole.FOLLOWER
-
             self.leader_id = leader_id
             self._reset_election_timer()
 
-            if prev_log_index > len(self.log):
-                return {
-                    "term": self.current_term,
-                    "success": False,
-                    "match_index": len(self.log),
-                }
-            if (
-                prev_log_index > 0
-                and self.log[prev_log_index - 1].term != prev_log_term
-            ):
-                return {
-                    "term": self.current_term,
-                    "success": False,
-                    "match_index": prev_log_index - 1,
-                }
+            if prev_log_index < self.last_included_index:
+                return self._append_failure()
+            if prev_log_index > self._last_log_index():
+                return self._append_failure()
+            if self._term_at(prev_log_index) != prev_log_term:
+                return self._append_failure(max(self.last_included_index, prev_log_index - 1))
 
             for entry in entries:
-                position = entry.index - 1
-                if position < len(self.log):
-                    if self.log[position].term != entry.term:
-                        self.log = self.log[:position]
-                        self.log.append(entry)
-                else:
+                if entry.index <= self.last_included_index:
+                    continue
+                existing_term = self._term_at(entry.index)
+                if existing_term is not None and existing_term != entry.term:
+                    self._truncate_from(entry.index)
+                if self._term_at(entry.index) is None:
                     self.log.append(entry)
 
             if leader_commit > self.commit_index:
-                self.commit_index = min(leader_commit, len(self.log))
+                self.commit_index = min(leader_commit, self._last_log_index())
                 self.apply_committed_entries()
+            self._persist_state()
 
-            match_index = prev_log_index + len(entries)
             return {
                 "term": self.current_term,
                 "success": True,
-                "match_index": match_index,
+                "match_index": prev_log_index + len(entries),
             }
+
+    def handle_install_snapshot(self, request: dict) -> dict:
+        """Install a complete teaching-style KV snapshot."""
+        term = int(request["term"])
+        leader_id = str(request["leader_id"])
+        snapshot_index = int(request["last_included_index"])
+        snapshot_term = int(request["last_included_term"])
+        kv = dict(request["kv"])
+
+        with self._lock:
+            if term < self.current_term:
+                return {"term": self.current_term, "success": False}
+            if term > self.current_term:
+                self._become_follower(term)
+            else:
+                self.role = NodeRole.FOLLOWER
+            self.leader_id = leader_id
+            self._reset_election_timer()
+
+            if snapshot_index <= self.last_included_index:
+                return {"term": self.current_term, "success": True}
+
+            keep_suffix = self._term_at(snapshot_index) == snapshot_term
+            self.log = (
+                [entry for entry in self.log if entry.index > snapshot_index]
+                if keep_suffix
+                else []
+            )
+            self.last_included_index = snapshot_index
+            self.last_included_term = snapshot_term
+            self.snapshot_exists = True
+            self.commit_index = max(self.commit_index, snapshot_index)
+            self.last_applied = max(self.last_applied, snapshot_index)
+            if self.state_machine is not None:
+                self.state_machine.load(kv)
+            self._save_snapshot(kv)
+            self._persist_state()
+            return {"term": self.current_term, "success": True}
 
     def status(self) -> dict:
         """Return public node status."""
@@ -231,6 +268,9 @@ class RaftNode:
                 "log_length": len(self.log),
                 "commit_index": self.commit_index,
                 "last_applied": self.last_applied,
+                "last_included_index": self.last_included_index,
+                "last_included_term": self.last_included_term,
+                "snapshot_exists": self.snapshot_exists,
             }
 
     def send_heartbeats(self) -> None:
@@ -238,13 +278,12 @@ class RaftNode:
         with self._lock:
             if self.role != NodeRole.LEADER:
                 return
-
         for peer in self.peers:
             self._replicate_to_peer(peer)
         self._advance_commit_index()
 
     def append_command(self, command: dict) -> dict:
-        """Append one debug command and attempt to replicate it."""
+        """Append one command and attempt to replicate it."""
         with self._lock:
             if self.role != NodeRole.LEADER:
                 return {
@@ -253,17 +292,17 @@ class RaftNode:
                     "leader_id": self.leader_id,
                 }
             entry = LogEntry(
-                index=len(self.log) + 1,
+                index=self._last_log_index() + 1,
                 term=self.current_term,
                 command=command,
             )
             self.log.append(entry)
+            self._persist_state()
 
         replicated_to = 1
         for peer in self.peers:
             if self._replicate_to_peer(peer):
                 replicated_to += 1
-
         self._advance_commit_index()
         self.send_heartbeats()
         with self._lock:
@@ -279,25 +318,17 @@ class RaftNode:
         read_result = self.ensure_read_quorum()
         if not read_result["success"]:
             return read_result
-
         with self._lock:
             if self.state_machine is None:
                 return {"success": False, "error": "state machine unavailable"}
             value = self.state_machine.get(key)
-            if value is None:
-                return {
-                    "success": False,
-                    "error": "NOT_FOUND",
-                    "read_index": read_result["read_index"],
-                    "linearizable_read": True,
-                }
-            return {
-                "success": True,
-                "key": key,
-                "value": value,
+            base = {
                 "read_index": read_result["read_index"],
                 "linearizable_read": True,
             }
+            if value is None:
+                return {"success": False, "error": "NOT_FOUND", **base}
+            return {"success": True, "key": key, "value": value, **base}
 
     def ensure_read_quorum(self) -> dict:
         """Confirm current leadership with a majority before serving a read."""
@@ -315,44 +346,9 @@ class RaftNode:
             if self.role != NodeRole.LEADER or self.current_term != read_term:
                 return self.not_leader_response()
             if successful_nodes < self._majority():
-                return {
-                    "success": False,
-                    "error": "read quorum unavailable",
-                }
+                return {"success": False, "error": "read quorum unavailable"}
             self.apply_committed_entries()
-            return {
-                "success": True,
-                "read_index": self.commit_index,
-            }
-
-    def _send_read_heartbeat(self, peer: str, read_term: int) -> bool:
-        """Send one empty AppendEntries request for a ReadIndex quorum check."""
-        with self._lock:
-            if self.role != NodeRole.LEADER or self.current_term != read_term:
-                return False
-            prev_log_index = len(self.log)
-            request = {
-                "term": read_term,
-                "leader_id": self.node_id,
-                "prev_log_index": prev_log_index,
-                "prev_log_term": self.log[-1].term if self.log else 0,
-                "entries": [],
-                "leader_commit": self.commit_index,
-            }
-
-        response = self.rpc_client.append_entries(peer, request)
-        if response is None:
-            return False
-
-        with self._lock:
-            if response["term"] > self.current_term:
-                self._become_follower(response["term"])
-                return False
-            return (
-                self.role == NodeRole.LEADER
-                and self.current_term == read_term
-                and bool(response.get("success"))
-            )
+            return {"success": True, "read_index": self.commit_index}
 
     def not_leader_response(self) -> dict:
         """Return a client-friendly leader redirect hint."""
@@ -364,40 +360,61 @@ class RaftNode:
         }
 
     def apply_committed_entries(self) -> None:
-        """Apply committed log entries in order and persist KV state."""
+        """Apply committed entries in order, persist KV, and create snapshots."""
         with self._lock:
             while self.last_applied < self.commit_index:
-                entry = self.log[self.last_applied]
+                next_index = self.last_applied + 1
+                if next_index <= self.last_included_index:
+                    self.last_applied = self.last_included_index
+                    continue
+                entry = self._entry_at(next_index)
+                if entry is None:
+                    break
                 if self.state_machine is not None:
                     self.state_machine.apply(entry.command)
                 self.last_applied = entry.index
+
             if self.storage is not None and self.state_machine is not None:
                 self.storage.save_kv(self.state_machine.dump())
+            if (
+                self.snapshot_threshold > 0
+                and self.last_applied - self.last_included_index
+                >= self.snapshot_threshold
+            ):
+                self._create_snapshot()
+            self._persist_state()
 
     def _replicate_to_peer(self, peer: str) -> bool:
-        """Replicate missing log entries to one follower."""
+        """Replicate missing state to one follower."""
         while True:
             with self._lock:
                 if self.role != NodeRole.LEADER:
                     return False
-                next_index = self.next_index.get(peer, len(self.log) + 1)
-                prev_log_index = next_index - 1
-                prev_log_term = (
-                    self.log[prev_log_index - 1].term if prev_log_index > 0 else 0
-                )
-                request = {
-                    "term": self.current_term,
-                    "leader_id": self.node_id,
-                    "prev_log_index": prev_log_index,
-                    "prev_log_term": prev_log_term,
-                    "entries": [
-                        asdict(entry) for entry in self.log[next_index - 1 :]
-                    ],
-                    "leader_commit": self.commit_index,
-                }
-                request_term = self.current_term
+                next_index = self.next_index.get(peer, self._last_log_index() + 1)
+                if next_index <= self.last_included_index:
+                    send_snapshot = True
+                    request = self._snapshot_request()
+                    request_term = self.current_term
+                else:
+                    send_snapshot = False
+                    prev_log_index = next_index - 1
+                    request = {
+                        "term": self.current_term,
+                        "leader_id": self.node_id,
+                        "prev_log_index": prev_log_index,
+                        "prev_log_term": self._term_at(prev_log_index) or 0,
+                        "entries": [
+                            asdict(entry) for entry in self._entries_from(next_index)
+                        ],
+                        "leader_commit": self.commit_index,
+                    }
+                    request_term = self.current_term
 
-            response = self.rpc_client.append_entries(peer, request)
+            response = (
+                self.rpc_client.install_snapshot(peer, request)
+                if send_snapshot
+                else self.rpc_client.append_entries(peer, request)
+            )
             if response is None:
                 return False
 
@@ -407,8 +424,12 @@ class RaftNode:
                     return False
                 if self.role != NodeRole.LEADER or self.current_term != request_term:
                     return False
+                if send_snapshot and response.get("success"):
+                    self.match_index[peer] = self.last_included_index
+                    self.next_index[peer] = self.last_included_index + 1
+                    continue
                 if response.get("success"):
-                    match_index = int(response.get("match_index", prev_log_index))
+                    match_index = int(response.get("match_index", next_index - 1))
                     self.match_index[peer] = match_index
                     self.next_index[peer] = match_index + 1
                     return True
@@ -416,37 +437,151 @@ class RaftNode:
                     return False
                 self.next_index[peer] = next_index - 1
 
+    def _send_read_heartbeat(self, peer: str, read_term: int) -> bool:
+        """Send one empty AppendEntries request for a ReadIndex quorum check."""
+        with self._lock:
+            if self.role != NodeRole.LEADER or self.current_term != read_term:
+                return False
+            last_index = self._last_log_index()
+            request = {
+                "term": read_term,
+                "leader_id": self.node_id,
+                "prev_log_index": last_index,
+                "prev_log_term": self._term_at(last_index) or 0,
+                "entries": [],
+                "leader_commit": self.commit_index,
+            }
+        response = self.rpc_client.append_entries(peer, request)
+        if response is None:
+            return False
+        with self._lock:
+            if response["term"] > self.current_term:
+                self._become_follower(response["term"])
+                return False
+            return (
+                self.role == NodeRole.LEADER
+                and self.current_term == read_term
+                and bool(response.get("success"))
+            )
+
     def _advance_commit_index(self) -> None:
         """Advance commit_index when a current-term entry has a majority."""
         with self._lock:
             if self.role != NodeRole.LEADER:
                 return
-            for index in range(len(self.log), self.commit_index, -1):
+            for index in range(self._last_log_index(), self.commit_index, -1):
                 replicated = 1 + sum(
                     match >= index for match in self.match_index.values()
                 )
                 if (
                     replicated >= self._majority()
-                    and self.log[index - 1].term == self.current_term
+                    and self._term_at(index) == self.current_term
                 ):
                     self.commit_index = index
                     self.apply_committed_entries()
                     return
 
-    def _run(self) -> None:
-        while not self._stop_event.wait(0.05):
-            now = time.monotonic()
-            with self._lock:
-                role = self.role
-                election_due = now - self.last_heartbeat_time >= self.election_timeout
-                heartbeat_due = now - self._last_heartbeat_sent >= self.heartbeat_interval
+    def _create_snapshot(self) -> None:
+        snapshot_index = self.last_applied
+        snapshot_term = self._term_at(snapshot_index)
+        if snapshot_term is None or self.state_machine is None:
+            return
+        self.last_included_index = snapshot_index
+        self.last_included_term = snapshot_term
+        self.snapshot_exists = True
+        self.log = [entry for entry in self.log if entry.index > snapshot_index]
+        self._save_snapshot(self.state_machine.dump())
 
-            if role == NodeRole.LEADER and heartbeat_due:
-                self.send_heartbeats()
-                with self._lock:
-                    self._last_heartbeat_sent = time.monotonic()
-            elif role != NodeRole.LEADER and election_due:
-                self.start_election()
+    def _snapshot_request(self) -> dict:
+        kv = self.state_machine.dump() if self.state_machine is not None else {}
+        return {
+            "term": self.current_term,
+            "leader_id": self.node_id,
+            "last_included_index": self.last_included_index,
+            "last_included_term": self.last_included_term,
+            "kv": kv,
+        }
+
+    def _save_snapshot(self, kv: dict) -> None:
+        if self.storage is None:
+            return
+        self.storage.save_snapshot(
+            {
+                "last_included_index": self.last_included_index,
+                "last_included_term": self.last_included_term,
+                "kv": kv,
+            }
+        )
+        self.storage.save_kv(kv)
+
+    def _restore_persistent_state(self) -> None:
+        if self.storage is None:
+            return
+        snapshot = self.storage.load_snapshot()
+        if snapshot:
+            self.last_included_index = int(snapshot["last_included_index"])
+            self.last_included_term = int(snapshot["last_included_term"])
+            self.snapshot_exists = True
+            if self.state_machine is not None:
+                self.state_machine.load(snapshot.get("kv", {}))
+
+        state = self.storage.load_state()
+        self.current_term = int(state.get("current_term", self.current_term))
+        self.voted_for = state.get("voted_for")
+        self.log = [LogEntry(**entry) for entry in state.get("log", [])]
+        self.commit_index = max(int(state.get("commit_index", 0)), self.last_included_index)
+        self.commit_index = min(self.commit_index, self._last_log_index())
+        self.last_applied = self.last_included_index
+        self.apply_committed_entries()
+
+    def _persist_state(self) -> None:
+        if self.storage is None:
+            return
+        self.storage.save_state(
+            {
+                "current_term": self.current_term,
+                "voted_for": self.voted_for,
+                "log": [asdict(entry) for entry in self.log],
+                "commit_index": self.commit_index,
+                "last_applied": self.last_applied,
+                "last_included_index": self.last_included_index,
+                "last_included_term": self.last_included_term,
+            }
+        )
+
+    def _last_log_index(self) -> int:
+        return self.log[-1].index if self.log else self.last_included_index
+
+    def _term_at(self, index: int) -> int | None:
+        if index == 0 and self.last_included_index == 0:
+            return 0
+        if index == self.last_included_index:
+            return self.last_included_term
+        entry = self._entry_at(index)
+        return entry.term if entry else None
+
+    def _entry_at(self, index: int) -> LogEntry | None:
+        position = index - self.last_included_index - 1
+        if 0 <= position < len(self.log):
+            entry = self.log[position]
+            if entry.index == index:
+                return entry
+        return next((entry for entry in self.log if entry.index == index), None)
+
+    def _entries_from(self, index: int) -> list[LogEntry]:
+        return [entry for entry in self.log if entry.index >= index]
+
+    def _truncate_from(self, index: int) -> None:
+        self.log = [entry for entry in self.log if entry.index < index]
+
+    def _append_failure(self, match_index: int | None = None) -> dict:
+        return {
+            "term": self.current_term,
+            "success": False,
+            "match_index": (
+                self._last_log_index() if match_index is None else match_index
+            ),
+        }
 
     def _become_follower(self, term: int) -> None:
         self.current_term = term
@@ -455,6 +590,21 @@ class RaftNode:
         self.leader_id = None
         self.votes_received.clear()
         self._reset_election_timer()
+        self._persist_state()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(0.05):
+            now = time.monotonic()
+            with self._lock:
+                role = self.role
+                election_due = now - self.last_heartbeat_time >= self.election_timeout
+                heartbeat_due = now - self._last_heartbeat_sent >= self.heartbeat_interval
+            if role == NodeRole.LEADER and heartbeat_due:
+                self.send_heartbeats()
+                with self._lock:
+                    self._last_heartbeat_sent = time.monotonic()
+            elif role != NodeRole.LEADER and election_due:
+                self.start_election()
 
     def _reset_election_timer(self) -> None:
         self.last_heartbeat_time = time.monotonic()

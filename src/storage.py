@@ -14,6 +14,7 @@ class JSONStorage:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.data_dir / "state.json"
         self.kv_path = self.data_dir / "kv.json"
+        self.snapshot_path = self.data_dir / "snapshot.json"
 
     def save_state(self, state_dict: dict) -> None:
         """Save node state atomically."""
@@ -30,6 +31,14 @@ class JSONStorage:
     def load_kv(self) -> dict:
         """Load key-value data, returning an empty dict when absent."""
         return self._load_json(self.kv_path)
+
+    def save_snapshot(self, snapshot_dict: dict) -> None:
+        """Save a Raft snapshot atomically."""
+        self._save_json(self.snapshot_path, snapshot_dict)
+
+    def load_snapshot(self) -> dict:
+        """Load a Raft snapshot, returning an empty dict when absent."""
+        return self._load_json(self.snapshot_path)
 
     def _save_json(self, path: Path, data: dict) -> None:
         temporary_path: str | None = None
