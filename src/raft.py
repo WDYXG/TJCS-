@@ -275,16 +275,84 @@ class RaftNode:
             }
 
     def get_value(self, key: str) -> dict:
-        """Read one value from the leader's local state machine."""
+        """Read one value after confirming the leader still has a quorum."""
+        read_result = self.ensure_read_quorum()
+        if not read_result["success"]:
+            return read_result
+
         with self._lock:
-            if self.role != NodeRole.LEADER:
-                return self.not_leader_response()
             if self.state_machine is None:
                 return {"success": False, "error": "state machine unavailable"}
             value = self.state_machine.get(key)
             if value is None:
-                return {"success": False, "error": "NOT_FOUND"}
-            return {"success": True, "key": key, "value": value}
+                return {
+                    "success": False,
+                    "error": "NOT_FOUND",
+                    "read_index": read_result["read_index"],
+                    "linearizable_read": True,
+                }
+            return {
+                "success": True,
+                "key": key,
+                "value": value,
+                "read_index": read_result["read_index"],
+                "linearizable_read": True,
+            }
+
+    def ensure_read_quorum(self) -> dict:
+        """Confirm current leadership with a majority before serving a read."""
+        with self._lock:
+            if self.role != NodeRole.LEADER:
+                return self.not_leader_response()
+            read_term = self.current_term
+
+        successful_nodes = 1
+        for peer in self.peers:
+            if self._send_read_heartbeat(peer, read_term):
+                successful_nodes += 1
+
+        with self._lock:
+            if self.role != NodeRole.LEADER or self.current_term != read_term:
+                return self.not_leader_response()
+            if successful_nodes < self._majority():
+                return {
+                    "success": False,
+                    "error": "read quorum unavailable",
+                }
+            self.apply_committed_entries()
+            return {
+                "success": True,
+                "read_index": self.commit_index,
+            }
+
+    def _send_read_heartbeat(self, peer: str, read_term: int) -> bool:
+        """Send one empty AppendEntries request for a ReadIndex quorum check."""
+        with self._lock:
+            if self.role != NodeRole.LEADER or self.current_term != read_term:
+                return False
+            prev_log_index = len(self.log)
+            request = {
+                "term": read_term,
+                "leader_id": self.node_id,
+                "prev_log_index": prev_log_index,
+                "prev_log_term": self.log[-1].term if self.log else 0,
+                "entries": [],
+                "leader_commit": self.commit_index,
+            }
+
+        response = self.rpc_client.append_entries(peer, request)
+        if response is None:
+            return False
+
+        with self._lock:
+            if response["term"] > self.current_term:
+                self._become_follower(response["term"])
+                return False
+            return (
+                self.role == NodeRole.LEADER
+                and self.current_term == read_term
+                and bool(response.get("success"))
+            )
 
     def not_leader_response(self) -> dict:
         """Return a client-friendly leader redirect hint."""

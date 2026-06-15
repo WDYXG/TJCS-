@@ -17,10 +17,11 @@
 - AppendEntries 日志一致性检查、冲突日志删除和多数提交。
 - committed 日志按顺序应用到 KV 状态机，并持久化每个节点的 KV 数据。
 - Leader 提供基于 Raft 日志的 HTTP PUT、GET 和 DELETE 接口。
+- ReadIndex 风格线性一致读：GET 不追加日志，但读取前会确认 Leader 仍持有多数派。
 - 使用 Python 标准库提供 Raft HTTP JSON RPC 和状态接口。
 
-当前尚未实现快照、成员变更和线性一致性读取协议。GET 暂时只允许访问
-Leader 的本地状态机。
+当前尚未实现快照和成员变更。GET 只允许 Leader 服务，并在读取前执行
+ReadIndex 多数派确认。
 
 ## 配置格式
 
@@ -161,6 +162,8 @@ Invoke-RestMethod http://127.0.0.1:8003/status
 ```
 
 三个节点的 `log_length`、`commit_index` 和 `last_applied` 应保持一致。
+成功 GET 响应还会包含 `read_index` 和 `linearizable_read: true`。GET 不会追加
+日志，但如果 Leader 无法联系多数派，则返回 `read quorum unavailable`。
 
 ## 自动演示脚本
 
@@ -197,6 +200,13 @@ python scripts/test_no_split_brain.py
 
 该脚本用于验证不会出现两个可提交写入的 Leader，并验证少数派的
 `commit_index` 不会推进、未提交写入不会应用到 KV 状态机。
+
+ReadIndex 演示会验证 GET 不追加日志、Leader 在一个 follower 宕机时仍可读取，
+以及仅剩 Leader 时无法完成线性一致读：
+
+```powershell
+python scripts/test_read_index.py
+```
 
 脚本每一步都会打印 `[OK]` 或 `[FAIL]`，适合截图放入课程报告。运行脚本前请
 确认默认端口 `8001`、`8002`、`8003` 没有被其他进程占用。自动脚本固定使用

@@ -11,11 +11,16 @@ from src.storage import JSONStorage
 class InMemoryRPCClient:
     def __init__(self) -> None:
         self.nodes: dict[str, RaftNode] = {}
+        self.unavailable: set[str] = set()
 
     def request_vote(self, peer: str, request: dict) -> dict | None:
+        if peer in self.unavailable:
+            return None
         return self.nodes[peer].handle_request_vote(request)
 
     def append_entries(self, peer: str, request: dict) -> dict | None:
+        if peer in self.unavailable:
+            return None
         return self.nodes[peer].handle_append_entries(request)
 
 
@@ -68,10 +73,40 @@ class RaftKVTest(unittest.TestCase):
     def test_get_value_only_succeeds_on_leader(self) -> None:
         self.leader.append_command({"type": "put", "key": "a", "value": "1"})
 
-        self.assertEqual(self.leader.get_value("a")["value"], "1")
+        leader_response = self.leader.get_value("a")
+        self.assertEqual(leader_response["value"], "1")
+        self.assertTrue(leader_response["linearizable_read"])
+        self.assertEqual(leader_response["read_index"], 1)
         follower_response = self.nodes["node2"].get_value("a")
         self.assertEqual(follower_response["error"], "not leader")
         self.assertEqual(follower_response["leader_hint"], "http://127.0.0.1:8001")
+
+    def test_read_index_does_not_append_log(self) -> None:
+        self.leader.append_command({"type": "put", "key": "a", "value": "1"})
+        log_length = len(self.leader.log)
+
+        response = self.leader.get_value("a")
+
+        self.assertTrue(response["success"])
+        self.assertEqual(len(self.leader.log), log_length)
+
+    def test_read_index_succeeds_with_one_follower_unavailable(self) -> None:
+        self.leader.append_command({"type": "put", "key": "a", "value": "1"})
+        self.client.unavailable.add("node3")
+
+        response = self.leader.get_value("a")
+
+        self.assertTrue(response["success"])
+        self.assertTrue(response["linearizable_read"])
+
+    def test_read_index_fails_without_majority(self) -> None:
+        self.leader.append_command({"type": "put", "key": "a", "value": "1"})
+        self.client.unavailable.update({"node2", "node3"})
+
+        response = self.leader.get_value("a")
+
+        self.assertFalse(response["success"])
+        self.assertEqual(response["error"], "read quorum unavailable")
 
 
 if __name__ == "__main__":

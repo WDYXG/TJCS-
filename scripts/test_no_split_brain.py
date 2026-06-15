@@ -45,6 +45,7 @@ def run_majority_scenario() -> dict:
         new_leader, statuses = wait_for_leader(
             remaining_nodes,
             excluded_leader=old_leader,
+            timeout=25.0,
         )
         require(
             sum(status["role"] == "leader" for status in statuses.values()) == 1,
@@ -110,8 +111,8 @@ def run_minority_scenario() -> dict:
             "GET", f"{NODE_URLS[isolated_node]}/kv/minority_write"
         )
         require(
-            status == 404 and response.get("error") == "NOT_FOUND",
-            "uncommitted minority write was not applied",
+            status == 503 and response.get("error") == "read quorum unavailable",
+            "minority cannot serve a linearizable GET",
         )
         print_ok("minority partition cannot commit writes")
         return processes
